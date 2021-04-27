@@ -1,9 +1,12 @@
 
-
+#include <Arduino.h>
 /*
     ESP8266 Access Control Firmware for HSBNE's Sonoff TH10 based control hardware.
     Written by nog3 August 2018
-    Contribs: pelrun (Sane rfid reading), jabeone (fix reset on some card reads bug)
+    Contribs: 
+      pelrun (Sane rfid reading)
+      jabeone (fix reset on some card reads bug)
+      Skip-GCTS (Converted to Platformio) 27-4-2021
 */
 
 // Include all the libraries we need for this.
@@ -69,6 +72,109 @@ void ICACHE_RAM_ATTR log(String entry) {
   delay(10);
 }
 
+void statusLight(char color) {
+  if (deviceType == "door") {
+    return;
+  }
+  if (currentColor == color) {
+    return;
+  } else {
+    switch (color) {
+      case 'r':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_STATIC, 0xFF0000, 1000, false);
+          break;
+        }
+      case 'g':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_STATIC, 0x00FF00, 1000, false);
+          break;
+        }
+      case 'b':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_STATIC, 0x0000FF, 1000, false);
+          break;
+        }
+      case 'y':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_STROBE, 0xFF6400, 250, false);
+          break;
+        }
+      case 'p':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_BREATH, 0x800080, 250, false);
+          break;
+        }
+      case 'w':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_BREATH, 0x0000FF, 250, false);
+          break;
+        }
+      case 'e':
+        {
+          ws2812fx.setSegment(0,  0,  0, FX_MODE_BREATH, 0x00FF00, 250, false);
+          break;
+        }
+    }
+    currentColor = color;
+    ws2812fx.service();
+  }
+}
+
+void toggleContact() {
+  switch (contact) {
+    case 0:
+      {
+        contact = 1;
+        digitalWrite(switchPin, HIGH);
+        statusLight('e');
+        break;
+      }
+    case 1:
+      {
+        contact = 0;
+        digitalWrite(switchPin, LOW);
+        statusLight('b');
+        break;
+      }
+  }
+}
+
+void pulseContact() {
+  switch (contact) {
+    case 0:
+      {
+        digitalWrite(switchPin, HIGH);
+        delay(5000);
+        digitalWrite(switchPin, LOW);
+        break;
+      }
+    case 1:
+      {
+        digitalWrite(switchPin, LOW);
+        delay(5000);
+        digitalWrite(switchPin, HIGH);
+        break;
+      }
+  }
+}
+
+
+
+void flushSerial () {
+  int flushCount = 0;
+  while (  Serial.available() ) {
+    char t = Serial.read();  // flush any remaining bytes.
+    flushCount++;
+    // Serial.println("flushed a byte");
+  }
+  if (flushCount > 0) {
+    log("[DEBUG] Flushed " + String(flushCount) + " bytes.");
+    flushCount = 0;
+  }
+
+}
+
 void ICACHE_RAM_ATTR checkIn() {
   // Serial.println("[CHECKIN] Standard checkin begin");
   // Delay to clear wifi buffer.
@@ -86,9 +192,17 @@ void ICACHE_RAM_ATTR checkIn() {
     if (httpCode == HTTP_CODE_OK) {
       String payload = client.getString();
       log("[CHECKIN] Server response: " + payload);
-      DynamicJsonBuffer jsonBuffer;
-      JsonObject&root = jsonBuffer.parseObject(payload.substring(payload.indexOf('{'), payload.length()));
-      String serverCacheHash = root["hashOfTags"].as<String>();
+      // DynamicJsonBuffer jsonBuffer;
+      DynamicJsonDocument jsonBuffer(256);
+      // JsonObject root = jsonBuffer.parseObject(payload.substring(payload.indexOf('{'), payload.length()));
+      auto error = deserializeJson(jsonBuffer, payload.substring(payload.indexOf('{'), payload.length()));
+      if (error) {
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+          return;
+      }
+      // String serverCacheHash = root["hashOfTags"].as<String>();
+      String serverCacheHash = jsonBuffer["hashOfTags"].as<String>();
       if (serverCacheHash != curCacheHash) {
         log("[CACHE] Cache hashes don't match, flagging update.");
         triggerFlag = 3;
@@ -142,6 +256,58 @@ void ICACHE_RAM_ATTR checkInSession(String sessionGUID, uint32_t cardNo) {
   delay(10);
 }
 
+void authCard(long tagid) {
+
+  log("[AUTH] Server auth check begin");
+  String url = String(host) + "/api/" + deviceType + "/check/" + String(tagid) + "/?secret=" + String(secret);
+  log("[AUTH] Get:" + String(url));
+  client.begin(url);
+
+  // Start http request.
+  int httpCode = client.GET();
+  // httpCode will be negative on error
+  if (httpCode > 0) {
+    log("[AUTH] Code: " + String(httpCode));
+
+    // Checkin succeeded.
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = client.getString();
+      log("[AUTH] Server response: " + payload);
+      DynamicJsonDocument jsonBuffer(256);
+      auto error = deserializeJson(jsonBuffer, payload.substring(payload.indexOf('{'), payload.length()));
+      if (error) {
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+          return;
+      }
+      if ( jsonBuffer[String("access")] == true ) {
+        log("[AUTH] Access granted.");
+        if (deviceType == "interlock") {
+          // sessionID = root["session_id"].as<String>();
+          sessionID = jsonBuffer["session_id"].as<String>();
+          toggleContact();
+          lastId = tagid;
+          heartbeatSession.attach(sessionCheckinRate, activeHeartBeatFlag);
+        } else {
+          lastId = tagid;
+          pulseContact();
+        }
+
+      } else {
+        log("[AUTH] Access not granted.");
+        statusLight('r');
+        delay(1000);
+      }
+
+    }
+  } else {
+    log("[AUTH] Error: " + client.errorToString(httpCode));
+    statusLight('y');
+  }
+  client.end();
+  log("[AUTH] Card Auth done.");
+  delay(10);
+}
 
 void readTagInterlock() {
   char tagBytes[6];
@@ -273,106 +439,7 @@ void startWifi () {
   delay(10);
 }
 
-void toggleContact() {
-  switch (contact) {
-    case 0:
-      {
-        contact = 1;
-        digitalWrite(switchPin, HIGH);
-        statusLight('e');
-        break;
-      }
-    case 1:
-      {
-        contact = 0;
-        digitalWrite(switchPin, LOW);
-        statusLight('b');
-        break;
-      }
-  }
-}
 
-void pulseContact() {
-  switch (contact) {
-    case 0:
-      {
-        digitalWrite(switchPin, HIGH);
-        delay(5000);
-        digitalWrite(switchPin, LOW);
-        break;
-      }
-    case 1:
-      {
-        digitalWrite(switchPin, LOW);
-        delay(5000);
-        digitalWrite(switchPin, HIGH);
-        break;
-      }
-  }
-}
-
-void statusLight(char color) {
-  if (deviceType == "door") {
-    return;
-  }
-  if (currentColor == color) {
-    return;
-  } else {
-    switch (color) {
-      case 'r':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_STATIC, 0xFF0000, 1000, false);
-          break;
-        }
-      case 'g':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_STATIC, 0x00FF00, 1000, false);
-          break;
-        }
-      case 'b':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_STATIC, 0x0000FF, 1000, false);
-          break;
-        }
-      case 'y':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_STROBE, 0xFF6400, 250, false);
-          break;
-        }
-      case 'p':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_BREATH, 0x800080, 250, false);
-          break;
-        }
-      case 'w':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_BREATH, 0x0000FF, 250, false);
-          break;
-        }
-      case 'e':
-        {
-          ws2812fx.setSegment(0,  0,  0, FX_MODE_BREATH, 0x00FF00, 250, false);
-          break;
-        }
-    }
-    currentColor = color;
-    ws2812fx.service();
-  }
-}
-
-void flushSerial () {
-  int flushCount = 0;
-  while (  Serial.available() ) {
-    char t = Serial.read();  // flush any remaining bytes.
-    flushCount++;
-    // Serial.println("flushed a byte");
-  }
-  if (flushCount > 0) {
-    log("[DEBUG] Flushed " + String(flushCount) + " bytes.");
-    flushCount = 0;
-  }
-
-}
 
 void httpRoot() {
   String message = "<html><head><script>var connection = new WebSocket('ws://'+location.hostname+':81/', ['arduino']);connection.onopen = function () {  connection.send('Connect ' + new Date()); }; connection.onerror = function (error) {    console.log('WebSocket Error ', error);};connection.onmessage = function (e) {  console.log('Server: ', e.data); var logObj = document.getElementById('logs'); logObj.insertAdjacentHTML('afterend', e.data + '</br>');;};</script><title>" + String(deviceName) + "</title></head>";
@@ -386,52 +453,7 @@ void httpRoot() {
   http.send(200, "text/html", message);
 }
 
-void authCard(long tagid) {
 
-  log("[AUTH] Server auth check begin");
-  String url = String(host) + "/api/" + deviceType + "/check/" + String(tagid) + "/?secret=" + String(secret);
-  log("[AUTH] Get:" + String(url));
-  client.begin(url);
-
-  // Start http request.
-  int httpCode = client.GET();
-  // httpCode will be negative on error
-  if (httpCode > 0) {
-    log("[AUTH] Code: " + String(httpCode));
-
-    // Checkin succeeded.
-    if (httpCode == HTTP_CODE_OK) {
-      String payload = client.getString();
-      log("[AUTH] Server response: " + payload);
-      DynamicJsonBuffer jsonBuffer;
-      JsonObject&root = jsonBuffer.parseObject(payload.substring(payload.indexOf('{'), payload.length()));
-      if ( root[String("access")] == true ) {
-        log("[AUTH] Access granted.");
-        if (deviceType == "interlock") {
-          sessionID = root["session_id"].as<String>();
-          toggleContact();
-          lastId = tagid;
-          heartbeatSession.attach(sessionCheckinRate, activeHeartBeatFlag);
-        } else {
-          lastId = tagid;
-          pulseContact();
-        }
-
-      } else {
-        log("[AUTH] Access not granted.");
-        statusLight('r');
-        delay(1000);
-      }
-
-    }
-  } else {
-    log("[AUTH] Error: " + client.errorToString(httpCode));
-    statusLight('y');
-  }
-  client.end();
-  log("[AUTH] Card Auth done.");
-  delay(10);
-}
 
 
 
@@ -450,6 +472,112 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       break;
   }
 
+}
+
+void printCache() {
+  String cacheContent;
+  File cacheFile = SPIFFS.open("/authorised.json", "r");
+  if (!cacheFile) {
+    cacheContent = "Error opening authorised json file.";
+  } else {
+    cacheContent = cacheFile.readStringUntil('\n');
+  }
+  cacheFile.close();
+
+  String message = "<html><head><title>" + String(deviceName) + " Cache</title></head>";
+  message += "<h2>Cache:</h2>";
+  message += cacheContent;
+  http.send(200, "text/html", message);
+}
+
+void loadTags() {
+  String cacheContent;
+  File cacheFile = SPIFFS.open("/authorised.json", "r");
+  if (!cacheFile) {
+    cacheContent = "Error opening authorised json file.";
+  } else {
+    cacheContent = cacheFile.readStringUntil('\n');
+  }
+  cacheFile.close();
+
+  DynamicJsonDocument jsonBuffer(1024);
+  auto error = deserializeJson(jsonBuffer, cacheContent.substring(cacheContent.indexOf('{'), cacheContent.length()));
+  if (error) {
+      Serial.print(F("deserializeJson() failed with code "));
+      Serial.println(error.c_str());
+      return;
+  }
+  // DynamicJsonBuffer jsonBuffer;
+  // JsonObject&root = jsonBuffer.parseObject(cacheContent.substring(cacheContent.indexOf('{'), cacheContent.length()));
+  JsonArray authorised_tags = jsonBuffer["authorised_tags"];
+  // authorised_tags.copyTo(tagsArray);
+  copyArray(authorised_tags, tagsArray);
+}
+
+
+void printTags() {
+  String message = "<html><head><title>" + String(deviceName) + " Tags</title></head>";
+  message += "<h2>Tags:</h2>";
+  if (tagsArray[0] > 0) {
+    for (int i = 0; i < sizeof(tagsArray) / sizeof(int); i++) {
+      if (tagsArray[i] > 0) {
+        message += String(tagsArray[i]) + "<br />";
+
+      }
+    }
+  } else {
+    message+= "No tag loaded in slot 0, assuming none loaded.";
+  }
+
+  http.send(200, "text/html", message);
+}
+
+void getCache () {
+  log("[CACHE] Acquiring cache.");
+  // Delay to clear wifi buffer.
+  delay(10);
+  String url = String(host) + "/api/" + deviceType + "/authorised/?secret=" + String(secret);
+  log("[CACHE] Get:" + String(url));
+  client.begin(url);
+
+  // Start http request.
+  int httpCode = client.GET();
+  // httpCode will be negative on error
+  if (httpCode > 0) {
+    // log("[SESSION] Code: " + String(httpCode));
+
+    // Checkin succeeded.
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = client.getString();
+      log("[CACHE] Server Response: " + payload);
+      File cacheFile = SPIFFS.open("/authorised.json", "w");
+      if (!cacheFile) {
+        log("[CACHE] Error opening authorised json file.");
+      } else {
+        cacheFile.print(payload + '\n');
+        cacheFile.close();
+      }
+      // Pull hash from the response, store in string in RAM.
+      // DynamicJsonBuffer jsonBuffer;
+      // JsonObject&root = jsonBuffer.parseObject(payload.substring(payload.indexOf('{'), payload.length()));
+
+      DynamicJsonDocument jsonBuffer(256);
+      auto error = deserializeJson(jsonBuffer, payload.substring(payload.indexOf('{'), payload.length()));
+      if (error) {
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+          return;
+      }
+
+      curCacheHash = jsonBuffer["authorised_tags_hash"].as<String>();
+
+    }
+  } else {
+    log("[CACHE] Error: " + client.errorToString(httpCode));
+  }
+  client.end();
+  log("[CACHE] Cache acquisition done.");
+  delay(10);
 }
 
 
@@ -557,9 +685,19 @@ void setup() {
     } else {
       String cacheBuf = cacheFile.readStringUntil('\n');
       cacheFile.close();
-      DynamicJsonBuffer jsonBuffer;
-      JsonObject&root = jsonBuffer.parseObject(cacheBuf.substring(cacheBuf.indexOf('{'), cacheBuf.length()));
-      curCacheHash = root["authorised_tags_hash"].as<String>();
+
+      DynamicJsonDocument jsonBuffer(256);
+      auto error = deserializeJson(jsonBuffer, cacheBuf.substring(cacheBuf.indexOf('{'), cacheBuf.length()));
+      if (error) {
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+          return;
+      }
+
+      curCacheHash = jsonBuffer["authorised_tags_hash"].as<String>();
+      // DynamicJsonBuffer jsonBuffer;
+      // JsonObject&root = jsonBuffer.parseObject(cacheBuf.substring(cacheBuf.indexOf('{'), cacheBuf.length()));
+      // curCacheHash = root["authorised_tags_hash"].as<String>();
     }
   }
 }
@@ -629,90 +767,11 @@ void loop()
 
 }
 
-void getCache () {
-  log("[CACHE] Acquiring cache.");
-  // Delay to clear wifi buffer.
-  delay(10);
-  String url = String(host) + "/api/" + deviceType + "/authorised/?secret=" + String(secret);
-  log("[CACHE] Get:" + String(url));
-  client.begin(url);
 
-  // Start http request.
-  int httpCode = client.GET();
-  // httpCode will be negative on error
-  if (httpCode > 0) {
-    // log("[SESSION] Code: " + String(httpCode));
 
-    // Checkin succeeded.
-    if (httpCode == HTTP_CODE_OK) {
-      String payload = client.getString();
-      log("[CACHE] Server Response: " + payload);
-      File cacheFile = SPIFFS.open("/authorised.json", "w");
-      if (!cacheFile) {
-        log("[CACHE] Error opening authorised json file.");
-      } else {
-        cacheFile.print(payload + '\n');
-        cacheFile.close();
-      }
-      // Pull hash from the response, store in string in RAM.
-      DynamicJsonBuffer jsonBuffer;
-      JsonObject&root = jsonBuffer.parseObject(payload.substring(payload.indexOf('{'), payload.length()));
-      curCacheHash = root["authorised_tags_hash"].as<String>();
 
-    }
-  } else {
-    log("[CACHE] Error: " + client.errorToString(httpCode));
-  }
-  client.end();
-  log("[CACHE] Cache acquisition done.");
-  delay(10);
-}
 
-void printCache() {
-  String cacheContent;
-  File cacheFile = SPIFFS.open("/authorised.json", "r");
-  if (!cacheFile) {
-    cacheContent = "Error opening authorised json file.";
-  } else {
-    cacheContent = cacheFile.readStringUntil('\n');
-  }
-  cacheFile.close();
 
-  String message = "<html><head><title>" + String(deviceName) + " Cache</title></head>";
-  message += "<h2>Cache:</h2>";
-  message += cacheContent;
-  http.send(200, "text/html", message);
-}
 
-void loadTags() {
-  String cacheContent;
-  File cacheFile = SPIFFS.open("/authorised.json", "r");
-  if (!cacheFile) {
-    cacheContent = "Error opening authorised json file.";
-  } else {
-    cacheContent = cacheFile.readStringUntil('\n');
-  }
-  cacheFile.close();
-  DynamicJsonBuffer jsonBuffer;
-  JsonObject&root = jsonBuffer.parseObject(cacheContent.substring(cacheContent.indexOf('{'), cacheContent.length()));
-  JsonArray& authorised_tags = root["authorised_tags"];
-  authorised_tags.copyTo(tagsArray);
-}
 
-void printTags() {
-  String message = "<html><head><title>" + String(deviceName) + " Tags</title></head>";
-  message += "<h2>Tags:</h2>";
-  if (tagsArray[0] > 0) {
-    for (int i = 0; i < sizeof(tagsArray) / sizeof(int); i++) {
-      if (tagsArray[i] > 0) {
-        message += String(tagsArray[i]) + "<br />";
-
-      }
-    }
-  } else {
-    message+= "No tag loaded in slot 0, assuming none loaded.";
-  }
-
-  http.send(200, "text/html", message);
-}
 

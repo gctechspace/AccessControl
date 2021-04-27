@@ -11,7 +11,7 @@ Interlock contains a Sonoff TH10, a 240v 20A 2Pole NO contactor, a 3.3v RFID rea
 
 More details on the hardware to come, including pictures.
 
-# Dependancies
+# Dependancies (Now handled by platformio)
 * WS2812FX 1.0.4
 * Adafruit_NeoPixel 1.1.4
 * ArduinoJson
