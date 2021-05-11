@@ -11,6 +11,10 @@ Interlock contains a Sonoff TH10, a 240v 20A 2Pole NO contactor, a 3.3v RFID rea
 
 More details on the hardware to come, including pictures.
 
+# Required
+Make sure to open secrets.tmp, save as secrets.h then modify to your hearts content.
+This file is ignored by git and won't be uploaded
+
 # Dependancies (Now handled by platformio)
 * WS2812FX 1.0.4
 * Adafruit_NeoPixel 1.1.4
